@@ -21,7 +21,8 @@
 </p>
 
 EdgeDeck is a full-screen FPV telemetry dashboard and session logger for a
-RadioMaster TX16S-style 480x272 color screen, EdgeTX, ExpressLRS, and Betaflight.
+RadioMaster TX16S color screen, EdgeTX, ExpressLRS, and Betaflight. It supports
+the original 480x272 display and the TX16S MK3 800x480 display.
 
 The goal is simple: make drone state easy to check on the radio before launch,
 between packs, or after landing without putting goggles back on or digging
@@ -79,8 +80,14 @@ the most important telemetry visible.
 
 ## Requirements
 
-- EdgeTX 2.11 or newer.
-- A color-screen EdgeTX RadioMaster TX16S.
+- Original TX16S / TX16S MK2: EdgeTX 2.11 or newer.
+- TX16S on EdgeTX 2.12: use stable 2.12.0 or newer. EdgeTX 2.12 changed LVGL
+  callback handling; EdgeDeck auto-detects 2.12+ and uses a static-label update
+  path. Companion 2.11 simulator tests the legacy callback path only.
+- TX16S MK3: stable EdgeTX 2.12.0 or newer with the matching `c800x480`
+  SD-card pack. Early factory and pre-release 2.12 builds contain known
+  Lua/LVGL crash bugs.
+- A color-screen EdgeTX RadioMaster TX16S, TX16S MK2, or TX16S MK3.
 - ExpressLRS transmitter module and receiver with telemetry enabled.
 - Betaflight sending CRSF telemetry.
 - Sensors discovered on radio.
@@ -106,6 +113,10 @@ the most important telemetry visible.
 
 If the widget is placed in a small zone, it will automatically use the compact
 focus layout.
+
+On a TX16S MK3, update both firmware and SD-card contents to matching stable
+EdgeTX 2.12 versions before installing EdgeDeck. STM32H7 radios use the H7/UF2
+update procedure documented by EdgeTX; back up radio and model settings first.
 
 For upgrades, copy the repository's `EdgeDeck` folder over
 `/WIDGETS/EdgeDeck/`. Runtime files such as `sessions.log` and `gps_last.txt`
@@ -270,12 +281,20 @@ coordinates.
 | Problem | What to check |
 | --- | --- |
 | Blank screen or EdgeTX warning | Make sure the radio is on EdgeTX 2.11 or newer. |
+| TX16S works in Companion 2.11 but crashes on the radio | The radio is likely on EdgeTX 2.12 while the simulator is 2.11. EdgeTX 2.12 hard-faults widgets that register many LVGL getter callbacks. Copy the latest `main.lua`; it detects firmware via `getVersion()` and switches paths automatically. Confirm the radio firmware under **Radio Settings → Version**. |
+| TX16S MK3 simulator crashes or radio enters Emergency Mode | Use stable EdgeTX 2.12.0 or newer and matching `c800x480` SD contents. Remove older copies of the widget before reinstalling. Bench-test while disarmed. |
+| `EdgeDeck safe mode` appears | The LVGL layout build failed once and was stopped instead of being retried. The screen shows the failed stage and a shortened error. Reload after correcting the reported problem. |
 | Values show `--` or `0` | Discover telemetry sensors with the model powered on. |
 | Arm state is wrong | Enable native CRSF telemetry and rediscover the `FM` sensor. |
 | GPS fields are empty | Confirm GPS telemetry is present and sensors such as `GPS`, `Sats`, `Alt`, `GSpd`, and `Dist` exist. |
 | QR does not build | Confirm `EdgeDeck/qrgen.lua` is installed beside `EdgeDeck/main.lua`, then reload the widget. |
 | Alerts are too noisy | Lower `Audio`, adjust thresholds, or use the mute button during flight. |
 | Full dashboard does not appear | Place the widget in a full-screen zone. |
+
+For startup diagnostics, set `CFG.debug.startupTrace = true` near the top of
+`EdgeDeck/main.lua`, reproduce once, then inspect
+`/WIDGETS/EdgeDeck/debug.log`. The file contains the last completed startup
+stage. Turn tracing off after diagnosis to avoid unnecessary SD writes.
 
 ## More Detail
 

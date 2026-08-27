@@ -1,6 +1,6 @@
 # EdgeDeck — FPV dashboard widget for RadioMaster TX16S
 
-A full-screen Lua widget for EdgeTX 2.11+ aimed at FPV pilots flying
+A full-screen Lua widget for EdgeTX aimed at FPV pilots flying
 ExpressLRS with a Betaflight (or iNav / EmuFlight) flight controller. It draws a
 shadcn-inspired dark card layout and is driven entirely by CRSF/ELRS telemetry —
 no switch or channel mapping required.
@@ -27,10 +27,12 @@ Five tabs, switched with the touch buttons across the top:
 
 ## Requirements
 
-- RadioMaster TX16S, or any EdgeTX color-screen radio at 480×272.
-- **EdgeTX 2.11 or newer** — the widget uses the LVGL-for-Lua API. On older
-  firmware it renders nothing but an "EdgeTX 2.11+ required" message; upgrade
-  first.
+- RadioMaster TX16S / TX16S MK2 at 480×272 with **EdgeTX 2.11 or newer**.
+- RadioMaster TX16S MK3 at 800×480 with **stable EdgeTX 2.12.0 or newer** and
+  matching `c800x480` SD-card contents. Early MK3 factory and pre-release 2.12
+  builds predate important Lua/LVGL object-creation and callback-reference fixes.
+- The widget uses the LVGL-for-Lua API. On older firmware it renders nothing but
+  an "EdgeTX 2.11+ required" message; upgrade first.
 - An ExpressLRS TX module with a bound receiver, so telemetry sensors exist.
 - A flight controller sending CRSF telemetry. Arm detection and the mode label
   work best with Betaflight's `FM` flight-mode sensor (see below).
@@ -244,12 +246,30 @@ The layout entry points are clearly marked:
 `EdgeDeck/qrgen.lua` contains the standalone incremental QR builder used by the
 GPS tab.
 
-Coordinates are absolute pixels for a 480×272 screen; the color palette and
-spacing values are configured through `CFG`.
+Full-screen builders use a 480-pixel-wide logical canvas. On 480×272 radios the
+coordinates are used directly. On 800×480 radios the canvas becomes 480×288 and
+the complete LVGL tree is uniformly scaled to physical pixels; touch coordinates
+are mapped back to the same logical space. Compact mode continues to use the
+actual `wgt.zone` dimensions.
+
+The FLY sparkline retains 30 LVGL rectangle references on 480×272 radios and
+updates them once per history sample. On 800×480 MK3-class radios the sparkline
+is static (no post-build `lvgl.rectangle`, no live updates) because both paths
+hard-fault some EdgeTX 2.12 H7 firmware builds. Full-screen MK3 startup also uses
+a one-frame bootstrap screen before building the full FLY layout, which avoids
+allocating the entire LVGL tree during widget registration.
 
 ## Troubleshooting
 
 - **Blank screen / "EdgeTX 2.11+ required"** → upgrade EdgeTX.
+- **TX16S MK3 crash / Emergency Mode** → use stable EdgeTX 2.12.0 or newer,
+  install matching `c800x480` SD contents, and retest with the aircraft disarmed.
+- **"EdgeDeck safe mode"** → the layout build threw an error. EdgeDeck displays
+  the failed stage once and does not retry the unsafe build every refresh.
+- **Need the last startup stage on hardware** → set
+  `CFG.debug.startupTrace = true`, reproduce once, and read
+  `/WIDGETS/EdgeDeck/debug.log`. Disable tracing afterward to avoid extra SD
+  writes.
 - **All values are 0 / `--`** → telemetry isn't being received. Check binding,
   antenna, and that the receiver has discovered sensors.
 - **Arm state or mode is wrong** → the `FM` sensor isn't present. Set

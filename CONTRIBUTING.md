@@ -16,6 +16,17 @@ Basic syntax check:
 lua -e 'assert(loadfile("EdgeDeck/main.lua")); assert(loadfile("EdgeDeck/qrgen.lua"))'
 ```
 
+Run the desktop EdgeTX/LVGL contract harness:
+
+```sh
+lua tests/edgetx_widget_harness.lua
+```
+
+The harness loads compact and full-screen layouts at 480×272 and 800×480,
+switches through every tab, checks LVGL geometry and callback budgets, runs
+repeated sparkline updates without rebuilding, and verifies the one-shot
+safe-mode fallback. It does not replace Companion or hardware testing.
+
 Avoid compiling `EdgeDeck/main.lua` into `main.luac` as part of normal
 development. The radio loads `/WIDGETS/EdgeDeck/main.lua` directly, and bytecode
 can vary by Lua build.
@@ -26,6 +37,8 @@ can vary by Lua build.
   logging, alerts, GPS save logic, and configuration.
 - `EdgeDeck/qrgen.lua` contains the incremental QR generator used by the GPS
   tab.
+- `tests/edgetx_widget_harness.lua` provides desktop startup and layout
+  regression coverage for TX16S and TX16S MK3 dimensions.
 - `README.md` is the user-facing guide.
 - `README_technical.md` is the maintainer-facing guide.
 - `examples/` contains sanitized examples of runtime files created on the radio.
@@ -45,10 +58,13 @@ Use the files in `examples/` when documenting formats or testing parsers.
 Before opening a pull request:
 
 - Run the Lua syntax check above.
+- Run `lua tests/edgetx_widget_harness.lua`.
 - Test in the EdgeTX simulator when the change affects UI, touch, paging, QR, or
-  telemetry display.
+  telemetry display. Use both TX16S 480×272 and TX16S MK3 800×480 profiles for
+  shared full-screen code.
 - Test on a radio when the change touches CPU-heavy paths, LVGL scrolling,
-  physical keys, logging, or QR generation.
+  physical keys, logging, or QR generation. Use stable EdgeTX 2.12.0 or newer
+  for the TX16S MK3 and bench-test while disarmed.
 - Keep unrelated refactors out of feature or bug-fix patches.
 - Update `README.md`, `README_technical.md`, or `CHANGELOG.md` when behavior
   changes.
