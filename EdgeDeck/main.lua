@@ -140,6 +140,13 @@ local CFG = {
     timestampLen = 15,
   },
 
+  debug = {
+    -- When true, overwrite this small marker at startup/build boundaries.
+    -- It is intentionally off for normal use to avoid extra SD writes.
+    startupTrace = false,
+    startupTracePath = "/WIDGETS/EdgeDeck/debug.log",
+  },
+
   session = {
     armCurrentA = 1.0,
     swapMinCapa = 30,
@@ -235,6 +242,39 @@ local CFG = {
   },
 }
 
+-- The original TX16S uses a 480x272 logical canvas. The TX16S MK3 reports
+-- 800x480; render that target through a 480x288 logical canvas and scale the
+-- resulting LVGL geometry uniformly. Uniform scaling keeps circles and QR
+-- modules square while using the whole MK3 screen.
+local compat = {
+  pixelW = (type(LCD_W) == "number" and LCD_W) or 480,
+  pixelH = (type(LCD_H) == "number" and LCD_H) or 272,
+}
+compat.highRes = compat.pixelW >= 720 and compat.pixelH >= 400
+compat.scale = compat.highRes and (compat.pixelW / 480) or 1
+do
+  -- EdgeTX 2.12+ hard-faults when callRefs evaluates many LVGL getter
+  -- callbacks (PR #7119 class). Companion 2.11 sim still tolerates them.
+  local maj, min = 2, 11
+  if type(getVersion) == "function" then
+    local ok, ver, _, m, n = pcall(getVersion)
+    if ok then
+      if type(m) == "number" then
+        maj, min = m, (type(n) == "number" and n) or 0
+      elseif type(ver) == "string" then
+        local a, b = string.match(ver, "(%d+)%.(%d+)")
+        if a then maj, min = tonumber(a), tonumber(b) or 0 end
+      end
+    end
+  end
+  compat.fwMajor = maj
+  compat.fwMinor = min
+  compat.staticLvgl = compat.highRes
+    or maj > 2 or (maj == 2 and min >= 12)
+end
+local SCR_W = compat.highRes and 480 or compat.pixelW
+local SCR_H = compat.highRes and math.floor(compat.pixelH / compat.scale + 0.5) or compat.pixelH
+
 -- Local aliases keep the rendering code compact while editable values remain
 -- easy to find in CFG above.
 local BG       = CFG.colors.bg
@@ -259,8 +299,7 @@ local FLY_STATUS_H = CFG.layout.flyStatusH
 local FLY_CARDS_H  = CFG.layout.flyCardsH
 local FLY_STATS_H  = CFG.layout.flyStatsH
 local FLY_FOOTER_H = CFG.layout.flyFooterH
-local FLY_FOOTER_Y = CONTENT_Y + FLY_STATUS_H + PAGE_GAP
-                   + FLY_CARDS_H + PAGE_GAP + FLY_STATS_H + PAGE_GAP
+local FLY_FOOTER_Y = SCR_H - PAGE_MARGIN - FLY_FOOTER_H
 local CARD_PAD_X   = CFG.layout.cardPadX
 local CARD_PAD_L   = CFG.layout.cardPadL
 local CARD_PAD_R   = CFG.layout.cardPadR
@@ -283,8 +322,6 @@ local function batIcon(cv)
 end
 
 -- LCD dimensions: fall back if globals are missing on a given firmware build.
-local SCR_W = (type(LCD_W) == "number" and LCD_W) or 480
-local SCR_H = (type(LCD_H) == "number" and LCD_H) or 272
 -- Page grid. Keep left/right gutters mathematically symmetric; hardware
 -- padding issues should be fixed in the card layout, not by shifting the
 -- entire screen.
@@ -314,6 +351,8 @@ local state = {
   stats = { minLQ=nil, minRSSI=nil, minPackV=nil, maxCurr=0, maxAlt=0, maxSpd=0, maxDist=0 },
   lastVoice = { lq=0, batt=0, tlost=0 },
   dirty = true,
+  layoutError = nil,
+  layoutErrorStage = nil,
   _lastHash = "",
   _lastBeep = 0,
   droneSeen = false,
@@ -373,6 +412,93 @@ local function safeColor(fn, fb)
   return function()
     local ok, v = pcall(fn); if ok and v ~= nil then return v end
     return fb or MUTED
+  end
+end
+
+function compat.shortError(err)
+  local s = tostring(err or "unknown error")
+  -- EdgeTX Lua strings do not support method-call syntax (s:gsub); use
+  -- string.* and plain literal patterns instead of character-class escapes.
+  s = string.gsub(s, "\r", " ")
+  s = string.gsub(s, "\n", " ")
+  if string.len(s) > 96 then s = string.sub(s, 1, 93) .. "..." end
+  return s
+end
+
+function compat.traceStartup(stage, detail)
+  if not CFG.debug.startupTrace then return end
+  local line = "EdgeDeck " .. tostring(stage)
+  if detail ~= nil then line = line .. ": " .. compat.shortError(detail) end
+  if type(print) == "function" then pcall(print, line) end
+  pcall(function()
+    local f = io.open(CFG.debug.startupTracePath, "a")
+    if not f then return end
+    io.write(f, line .. "\n")
+    io.close(f)
+  end)
+end
+
+-- MK3 (800x480) firmware hard-faults when callRefs evaluates many LVGL getter
+-- callbacks (EdgeTX PR #7119 class of bug). Build with static label values and
+-- push live telemetry through named label:set() in refresh instead.
+function compat.mk3Eval(fn, fb)
+  local ok, v = pcall(fn)
+  if ok and v ~= nil then return v end
+  return fb
+end
+
+function compat.mk3BeginBuild(wgt)
+  if not compat.staticLvgl or not wgt then return end
+  compat._mk3BuildWgt = wgt
+  wgt._mk3Dyn = {}
+  compat._mk3DynSeq = 0
+end
+
+function compat.mk3Track(textFn, colorFn)
+  local wgt = compat._mk3BuildWgt
+  if not wgt then return nil end
+  compat._mk3DynSeq = (compat._mk3DynSeq or 0) + 1
+  local name = "m" .. compat._mk3DynSeq
+  wgt._mk3Dyn[name] = { textFn = textFn, colorFn = colorFn }
+  return name
+end
+
+function compat.noteLayoutBuilt(wgt, full)
+  if not wgt then return end
+  wgt._builtTab = state.tab
+  wgt._builtFull = full
+  wgt._builtLogSel = state.selectedSess
+  wgt._builtLogPage = state.logPage
+  wgt._builtGpsQr = state.gps.showQr
+end
+
+function compat.mk3NeedsRebuild(wgt, full)
+  if wgt._builtFull ~= full then return true end
+  if wgt._builtTab ~= state.tab then return true end
+  if state.tab == 3 then
+    if wgt._builtLogSel ~= state.selectedSess then return true end
+    if (wgt._builtLogPage or 1) ~= (state.logPage or 1) then return true end
+  end
+  if state.tab == 4 and wgt._builtGpsQr ~= state.gps.showQr then return true end
+  return false
+end
+
+function compat.refreshMk3Dynamics(wgt)
+  if not compat.staticLvgl or not wgt or not wgt.ui or not wgt._mk3Dyn then return end
+  for name, spec in pairs(wgt._mk3Dyn) do
+    local obj = wgt.ui[name]
+    if obj and type(obj.set) == "function" then
+      local upd = {}
+      if spec.textFn then
+        local ok, v = pcall(spec.textFn)
+        if ok and v ~= nil then upd.text = v end
+      end
+      if spec.colorFn then
+        local ok, v = pcall(spec.colorFn)
+        if ok and v ~= nil then upd.color = v end
+      end
+      if next(upd) ~= nil then pcall(obj.set, obj, upd) end
+    end
   end
 end
 
@@ -1494,10 +1620,11 @@ end
 
 local function sampleHistory()
   local now = getTime()
-  if (now - state.lastSample) < CFG.runtime.historySampleCs then return end
+  if (now - state.lastSample) < CFG.runtime.historySampleCs then return false end
   state.lastSample = now
   for i = 1, state.histN - 1 do state.history[i] = state.history[i+1] end
   state.history[state.histN] = lq()
+  return true
 end
 
 -- ============================================================================
@@ -1804,23 +1931,68 @@ end
 -- ============================================================================
 local plainLabel
 
+function compat.scalePx(v)
+  if not compat.highRes or type(v) ~= "number" then return v end
+  if v <= 0 then return v end
+  return math.floor(v * compat.scale + 0.5)
+end
+
+function compat.scaleFullTree(tree)
+  if not compat.highRes then return tree end
+  local function scaleNode(node)
+    if type(node) ~= "table" then return end
+    for _, key in ipairs({ "x", "y", "w", "h", "rounded", "cornerRadius" }) do
+      if type(node[key]) == "number" then
+        -- Negative child offsets (tab bookmarks) must stay small; scaling
+        -- them for 800x480 has triggered LVGL faults on MK3 firmware.
+        if (key == "x" or key == "y") and node[key] < 0 then
+          -- keep literal offset
+        else
+          node[key] = compat.scalePx(node[key])
+        end
+      end
+    end
+    if type(node.children) == "table" then
+      for _, child in ipairs(node.children) do scaleNode(child) end
+    end
+  end
+  for _, node in ipairs(tree) do scaleNode(node) end
+  return tree
+end
+
 -- Card primitive. Rounded corners enabled (LVGL accepts 'rounded' on
 -- rectangle on EdgeTX 2.11 builds; the sim confirms it renders).
 local function cardOutlined(x, y, w, h, children, color)
-  return {
+  local colorFn = type(color) == "function" and color or nil
+  local node = {
     type = "rectangle", x = x, y = y, w = w, h = h,
-    color = color or CARD, filled = true, rounded = RADIUS,
+    filled = true, rounded = RADIUS,
     children = children or {},
   }
+  if compat.staticLvgl then
+    if colorFn then
+      node.name = compat.mk3Track(nil, colorFn)
+      node.color = compat.mk3Eval(colorFn, CARD)
+    else
+      node.color = color or CARD
+    end
+  else
+    node.color = color or CARD
+  end
+  return node
 end
 
 local function scrollCard(x, y, w, h, children, color)
-  return {
+  local node = {
     type = "rectangle", x = x, y = y, w = w, h = h,
     color = color or CARD, filled = true, rounded = RADIUS,
-    scrollBar = true, scrollDir = lvgl.SCROLL_VERTICAL,
     children = children or {},
   }
+  if not compat.highRes then
+    node.scrollBar = true
+    node.scrollDir = lvgl.SCROLL_VERTICAL
+  end
+  return node
 end
 
 local function bgFill()
@@ -1842,22 +2014,38 @@ local function flatButton(x, y, w, h, txt, fillFn, fgColor)
   local approxW = math.max(1, #s) * 7   -- UTF-8 byte-based approximation
   local labelX  = math.max(2, math.floor((w - approxW) / 2))
   local labelY  = math.max(2, math.floor((h - 16) / 2))
-  return {
+  local node = {
     type = "rectangle", x = x, y = y, w = w, h = h, rounded = RADIUS,
-    filled = true, color = fillFn, scrollBar = false,
+    filled = true, color = fillFn,
     children = {
       plainLabel(labelX, labelY, math.max(1, w - labelX), math.max(18, h - labelY),
         nil, fgColor or TEXT, txt, LEFT),
     },
   }
+  if not compat.highRes then node.scrollBar = false end
+  return node
 end
 
 function plainLabel(x, y, w, h, font, color, text, align)
-  return {
+  if not compat.staticLvgl then
+    return {
+      type = "label", x = x, y = y, w = w, h = h,
+      font = font, color = color, text = text, align = align or LEFT,
+      scrollBar = false, scrollDir = NO_SCROLL,
+    }
+  end
+  local textFn = type(text) == "function" and text or nil
+  local colorFn = type(color) == "function" and color or nil
+  local node = {
     type = "label", x = x, y = y, w = w, h = h,
-    font = font, color = color, text = text, align = align or LEFT,
-    scrollBar = false, scrollDir = NO_SCROLL,
+    font = font, align = align or LEFT,
   }
+  node.text = textFn and compat.mk3Eval(textFn, "--") or (text or "")
+  node.color = colorFn and compat.mk3Eval(colorFn, MUTED) or (color or TEXT)
+  if textFn or colorFn then
+    node.name = compat.mk3Track(textFn, colorFn)
+  end
+  return node
 end
 
 local function tabBar(wgt)
@@ -1875,18 +2063,26 @@ local function tabBar(wgt)
     -- for the default font on uppercase glyphs.
     local approxW  = math.max(1, #label) * 7
     local labelX   = math.max(2, math.floor((w - approxW) / 2) - 2)
-    return {
+    local tabColorFn = function()
+      if state.tab == n then return wgt.options.AccentColor end
+      return BG
+    end
+    local tabNode = {
       type = "rectangle",
       x = PAGE_X + n*60, y = -RADIUS, w = w, h = 32 + RADIUS,
       rounded = RADIUS, filled = true,
-      color = safeColor(function()
-        if state.tab == n then return wgt.options.AccentColor end
-        return BG
-      end, BG),
       children = {
         plainLabel(labelX, RADIUS + 10, w - labelX, 20, nil, TEXT, label, LEFT),
       },
     }
+    if compat.staticLvgl then
+      tabNode.name = "tab" .. n
+      tabNode.color = compat.mk3Eval(tabColorFn, BG)
+      if wgt._mk3Dyn then wgt._mk3Dyn["tab" .. n] = { colorFn = tabColorFn } end
+    else
+      tabNode.color = safeColor(tabColorFn, BG)
+    end
+    return tabNode
   end
   return {
     type = "rectangle", x = 0, y = 0, w = SCR_W, h = 40,
@@ -2048,6 +2244,47 @@ end
 -- ============================================================================
 -- FLIGHT TAB (live dashboard)
 -- ============================================================================
+local function appendSparklineBars(kids, wgt, footerY)
+  local sparkH = 26
+  local sparkBaseX = PAGE_X + 76
+  local sparkBaseY = footerY + math.floor((FLY_FOOTER_H - sparkH) / 2)
+  if compat.staticLvgl then
+    -- Static bars on 2.12+ and MK3. pos/size callbacks hard-fault when callRefs
+    -- evaluates many getters on real hardware (simulator 2.11 still tolerates them).
+    for i = 1, 30 do
+      table.insert(kids, {
+        type = "rectangle", filled = true,
+        x = sparkBaseX + (i - 1) * 4, y = sparkBaseY + sparkH - 1, w = 3, h = 1,
+        color = MUTED,
+      })
+    end
+    return
+  end
+  -- Original TX16S path: pos/size/color callbacks (verified on 480x272 hardware).
+  for i = 1, 30 do
+    table.insert(kids, {
+      type = "rectangle", filled = true,
+      x = sparkBaseX + (i - 1) * 4, y = sparkBaseY + sparkH - 1, w = 3, h = 1,
+      color = safeColor(function()
+        local h = state.history[(state.histN - 30) + i] or 0
+        if h <= opt(wgt, "LQ_Crit", 50) then return RED    end
+        if h <= opt(wgt, "LQ_Warn", 80) then return YELLOW end
+        return GREEN
+      end, MUTED),
+      pos = function()
+        local h = state.history[(state.histN - 30) + i] or 0
+        local bh = math.floor(h * sparkH / 100); if bh < 1 then bh = 1 end
+        return sparkBaseX + (i - 1) * 4, sparkBaseY + sparkH - bh
+      end,
+      size = function()
+        local h = state.history[(state.histN - 30) + i] or 0
+        local bh = math.floor(h * sparkH / 100); if bh < 1 then bh = 1 end
+        return 3, bh
+      end,
+    })
+  end
+end
+
 local function buildFlight(wgt)
   local kids = { bgFill(), tabBar(wgt) }
   local fullW    = PAGE_W
@@ -2159,42 +2396,13 @@ local function buildFlight(wgt)
   end, "--", RIGHT))
   table.insert(kids, cardOutlined(PAGE_X, statsY, fullW, FLY_STATS_H, statKids))
 
-  -- Sparkline + alert bar combined. The sparkline rectangles (added to kids
-  -- below) use absolute screen coords with per-frame pos/size callbacks to
-  -- grow/shrink each bar. The card here is just the background frame.
+  -- Sparkline + alert bar combined. MK3 uses static bars; TX16S keeps the
+  -- original pos/size callbacks that are verified on 480x272 hardware.
   local footerTextY = math.floor((FLY_FOOTER_H - 16) / 2)
-  local sparkH = 26
-  local sparkBaseY = footerY + math.floor((FLY_FOOTER_H - sparkH) / 2)
   table.insert(kids, cardOutlined(PAGE_X, footerY, fullW, FLY_FOOTER_H, {
     plainLabel(CARD_PAD_L, footerTextY, 80, 20, nil, MUTED, "LQ 60s", LEFT),
   }))
-  for i = 1, 30 do
-    local sparkBaseX = PAGE_X + 76
-    -- Static x/y/w/h provide first-paint dimensions; pos/size callbacks
-    -- take over on subsequent frames once telemetry samples accumulate.
-    table.insert(kids, {
-      type = "rectangle", filled = true,
-      x = sparkBaseX + (i-1)*4, y = sparkBaseY + sparkH - 1, w = 3, h = 1,
-      color = safeColor(function()
-        local h = state.history[(state.histN - 30) + i] or 0
-        -- Use the same immediate thresholds as the live LQ display. Audio
-        -- alerts add a hold delay, but visual severity should react instantly.
-        if h <= opt(wgt, "LQ_Crit", 50) then return RED    end
-        if h <= opt(wgt, "LQ_Warn", 80) then return YELLOW end
-        return GREEN
-      end, MUTED),
-      pos = function()
-        local h = state.history[(state.histN - 30) + i] or 0
-        local bh = math.floor(h * sparkH / 100); if bh < 1 then bh = 1 end
-        return sparkBaseX + (i-1)*4, sparkBaseY + sparkH - bh
-      end,
-      size = function()
-        local h = state.history[(state.histN - 30) + i] or 0
-        local bh = math.floor(h * sparkH / 100); if bh < 1 then bh = 1 end
-        return 3, bh
-      end,
-    })
-  end
+  appendSparklineBars(kids, wgt, footerY)
   -- Telemetry status + mute button on right side of the same row.
   table.insert(kids, plainLabel(PAGE_X + 206, footerY + footerTextY, 220, 22, BOLD,
     safeColor(function() return alertFgColor(wgt) end, MUTED),
@@ -2759,16 +2967,55 @@ local FULL_SCREEN_BUILDERS = {
   [4] = buildGps,
 }
 
+local function buildMk3Bootstrap(wgt)
+  lvgl.clear()
+  wgt.ui = lvgl.build(compat.scaleFullTree({
+    bgFill(),
+    plainLabel(PAGE_X, CONTENT_Y + 48, PAGE_W - 2 * PAGE_MARGIN, 28,
+      BOLD, TEXT, "EdgeDeck", CENTER),
+  })) or {}
+  wgt._deferFullLayout = true
+end
+
 local function buildFullScreen(wgt)
+  if compat.highRes then
+    -- One splash ever, then direct full builds (including tab changes).
+    if not wgt._mk3BootSplashDone then
+      wgt._mk3BootSplashDone = true
+      buildMk3Bootstrap(wgt)
+      return
+    end
+    if wgt._deferFullLayout then
+      wgt._deferFullLayout = false
+    end
+    compat.traceStartup("build-full-tab-" .. tostring(state.tab))
+    compat.mk3BeginBuild(wgt)
+    lvgl.clear()
+    local builder = FULL_SCREEN_BUILDERS[state.tab] or buildFlight
+    local tree = compat.scaleFullTree(builder(wgt))
+    wgt.ui = lvgl.build(tree) or {}
+    wgt._mk3FullReady = true
+    compat.noteLayoutBuilt(wgt, true)
+    return
+  end
+
   lvgl.clear()
   local builder = FULL_SCREEN_BUILDERS[state.tab] or buildFlight
-  lvgl.build(builder(wgt))
+  if compat.staticLvgl then
+    compat.mk3BeginBuild(wgt)
+    wgt.ui = lvgl.build(builder(wgt)) or {}
+    wgt._mk3FullReady = true
+    compat.noteLayoutBuilt(wgt, true)
+  else
+    lvgl.build(builder(wgt))
+  end
 end
 
 -- Focus-mode zone layout. This is not a mini full-screen dashboard; it keeps
 -- only the high-signal flight checks visible in a regular model-screen zone:
 -- arm/mode, pack health, link health, and telemetry status.
 local function buildZone(wgt)
+  if compat.staticLvgl then compat.mk3BeginBuild(wgt) end
   lvgl.clear()
   local zx, zy, zw, zh = wgt.zone.x, wgt.zone.y, wgt.zone.w, wgt.zone.h
   local gap = PAGE_GAP
@@ -2789,7 +3036,7 @@ local function buildZone(wgt)
   local modeW = math.max(40, topInnerW - armW - satW - 16)
   local bottomHalf = math.floor(topInnerW / 2)
 
-  lvgl.build({
+  local zoneTree = {
     { type = "rectangle", x = zx, y = zy, w = zw, h = zh,
       color = BG, filled = true, rounded = RADIUS },
 
@@ -2839,18 +3086,54 @@ local function buildZone(wgt)
         nil, safeColor(function() return alertFgColor(wgt) end, MUTED),
         safeStr(function() return telemetryText(wgt) end, ""), RIGHT),
     }),
-  })
+  }
+  if compat.staticLvgl then
+    wgt.ui = lvgl.build(zoneTree) or {}
+    compat.noteLayoutBuilt(wgt, false)
+  else
+    lvgl.build(zoneTree)
+  end
 end
 
 -- ============================================================================
 -- WIDGET API
 -- ============================================================================
 local function create(zone, opts)
-  return { zone = zone, options = opts, isFull = nil }
+  return {
+    zone = zone,
+    options = opts,
+    isFull = nil,
+    ui = nil,
+    layoutFailed = false,
+    _mk3BootSplashDone = false,
+    _mk3FullReady = false,
+    _deferFullLayout = false,
+  }
 end
 
 local function update(wgt, opts)
-  wgt.options = opts; wgt.isFull = nil; state.dirty = true
+  wgt.options = opts
+  if not compat.staticLvgl then
+    wgt.isFull = nil
+    state.dirty = true
+    return
+  end
+  compat.traceStartup("update")
+  -- Widget settings always call update() on close (even without changes).
+  -- Options are dynamic; structural layout does not change. Suppress rebuild.
+  if wgt.layoutFailed then
+    local wasFull = wgt.isFull == true
+    wgt.layoutFailed = false
+    wgt.ui = nil
+    wgt.isFull = nil
+    state.layoutError = nil
+    state.layoutErrorStage = nil
+    wgt._latchFullLayout = compat.highRes or wasFull
+    state.dirty = true
+  else
+    state.dirty = false
+    if wgt.isFull == true then wgt._latchFullLayout = true end
+  end
 end
 
 local function isFullScreen()
@@ -2858,13 +3141,56 @@ local function isFullScreen()
   local ok, v = pcall(lvgl.isFullScreen); return ok and v == true
 end
 
-local function ensureLayout(wgt)
+-- lvgl.isFullScreen() can read false on MK3 during widget-settings exit (and
+-- briefly at startup) even though the dashboard is fullscreen. Picking zone
+-- layout there builds the wrong tree and has triggered hard faults.
+local function layoutFullScreen(wgt)
+  local apiFull = isFullScreen()
+  if apiFull then
+    if wgt then wgt._latchFullLayout = false end
+    return true
+  end
+  if not wgt then return false end
+  if wgt._latchFullLayout and wgt.isFull == true then
+    compat.traceStartup("full-latch-after-settings")
+    return true
+  end
+  if compat.highRes then
+    if wgt._mk3FullReady or wgt.isFull == true then return true end
+    local zw = wgt.zone and wgt.zone.w or 0
+    local zh = wgt.zone and wgt.zone.h or 0
+    if zw >= math.floor(compat.pixelW * 0.85)
+       and zh >= math.floor(compat.pixelH * 0.85) then
+      return true
+    end
+  end
+  return false
+end
+
+function compat.buildLayoutFallback(wgt, full, stage, err)
+  local zx, zy, zw, zh = 0, 0, compat.pixelW, compat.pixelH
+  if not full and wgt.zone then
+    zx, zy = wgt.zone.x or 0, wgt.zone.y or 0
+    zw, zh = wgt.zone.w or compat.pixelW, wgt.zone.h or compat.pixelH
+  end
+  local width = math.max(1, zw - 16)
+  lvgl.clear()
+  wgt.ui = lvgl.build({
+    { type = "rectangle", x = zx, y = zy, w = zw, h = zh,
+      color = BG, filled = true, children = {
+        { type = "label", x = 8, y = 8, w = width, h = 28,
+          color = RED, font = BOLD, text = "EdgeDeck safe mode" },
+        { type = "label", x = 8, y = 40, w = width, h = 24,
+          color = TEXT, text = "Stage: " .. tostring(stage or "layout") },
+        { type = "label", x = 8, y = 68, w = width, h = math.max(24, zh - 76),
+          color = MUTED, text = compat.shortError(err) },
+      } },
+  }) or {}
+end
+
+local function ensureLayoutLegacy(wgt)
   local full = isFullScreen()
   if full ~= wgt.isFull or state.dirty then
-    -- Wrap the build path so transient failures (e.g. OOM under heap
-    -- pressure) leave dirty=true for a retry instead of freezing the UI.
-    -- buildFullScreen/buildZone clear first, so a failed attempt may blank
-    -- the tree until the next successful refresh.
     local ok = pcall(function()
       if full then buildFullScreen(wgt) else buildZone(wgt) end
     end)
@@ -2872,11 +3198,69 @@ local function ensureLayout(wgt)
       wgt.isFull = full
       state.dirty = false
     else
-      -- Build failed. Keep dirty=true to retry; force a GC right now to
-      -- give the next attempt the best chance at finding contiguous memory.
       pcall(collectgarbage, "collect")
     end
   end
+  return false
+end
+
+local function ensureLayout(wgt)
+  if not compat.staticLvgl then
+    return ensureLayoutLegacy(wgt)
+  end
+  local full = compat.highRes and layoutFullScreen(wgt) or isFullScreen()
+  if wgt.layoutFailed then
+    -- State changes elsewhere (notably incremental QR generation) may mark
+    -- the shared layout dirty. Safe mode must remain latched until EdgeTX
+    -- calls update() or the widget is reloaded. Do not consume the shared
+    -- dirty flag here; another healthy EdgeDeck instance may still need it.
+    return false
+  end
+  if compat.highRes and wgt._mk3BootSplashDone and state.dirty and state._eatingTouch then
+    compat.traceStartup("rebuild-deferred-touch")
+    return false
+  end
+  if full ~= wgt.isFull or state.dirty then
+    if wgt._mk3FullReady and state.dirty and full == wgt.isFull then
+      if not compat.mk3NeedsRebuild(wgt, full) then
+        state.dirty = false
+        return false
+      end
+    end
+    local stage = full and "build-full" or "build-zone"
+    compat.traceStartup(stage .. "-begin")
+    local ok, err = pcall(function()
+      if full then buildFullScreen(wgt) else buildZone(wgt) end
+    end)
+    if ok then
+      wgt.isFull = full
+      wgt.layoutFailed = false
+      state.layoutError = nil
+      state.layoutErrorStage = nil
+      if wgt._deferFullLayout then
+        state.dirty = true
+      else
+        state.dirty = false
+      end
+      compat.traceStartup(stage .. "-ok")
+      return true
+    else
+      -- Do not repeat a failed clear/build every refresh. On affected H7
+      -- firmware that retry loop can turn a recoverable Lua error into an
+      -- LVGL allocation storm or hard fault.
+      state.layoutError = compat.shortError(err)
+      state.layoutErrorStage = stage
+      state.dirty = false
+      wgt.layoutFailed = true
+      wgt.ui = nil
+      compat.traceStartup(stage .. "-error", err)
+      pcall(collectgarbage, "collect")
+      local fallbackOk, fallbackErr = pcall(compat.buildLayoutFallback, wgt, full, stage, err)
+      if not fallbackOk then compat.traceStartup("fallback-error", fallbackErr) end
+      return false
+    end
+  end
+  return false
 end
 
 local function refresh(wgt, event, touchState)
@@ -2919,6 +3303,10 @@ local function refresh(wgt, event, touchState)
       if type(x) == "number" and type(y) == "number" then
         local sx = touchState.startX or x
         local sy = touchState.startY or y
+        if compat.highRes and isFullScreen() then
+          x, y = x / compat.scale, y / compat.scale
+          sx, sy = sx / compat.scale, sy / compat.scale
+        end
         local moved = math.abs(x - sx) > CFG.touch.moveThreshold
                    or math.abs(y - sy) > CFG.touch.moveThreshold
         local blocked = getTime() < (state._touchBlockUntil or 0)
@@ -2949,8 +3337,21 @@ local function refresh(wgt, event, touchState)
     end
   end
   pcall(tickFlight, wgt)
-  pcall(sampleHistory)
-  pcall(ensureLayout, wgt)
+  if compat.staticLvgl then
+    local sampleOk, sampleChanged = pcall(sampleHistory)
+    local layoutOk, rebuilt = pcall(ensureLayout, wgt)
+    if not layoutOk then
+      state.layoutError = compat.shortError(rebuilt)
+      state.layoutErrorStage = "ensure-layout"
+      compat.traceStartup("ensure-layout-error", rebuilt)
+    end
+    if not rebuilt then
+      pcall(compat.refreshMk3Dynamics, wgt)
+    end
+  else
+    pcall(sampleHistory)
+    pcall(ensureLayout, wgt)
+  end
   pcall(maybeBeep, wgt)
   pcall(maybeVoice, wgt)
 end
